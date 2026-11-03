@@ -1,4 +1,4 @@
-﻿// Coolapk2MD —— 酷安图文/动态 -> 本地 Markdown + 图片
+// Coolapk2MD —— 酷安图文/动态 -> 本地 Markdown + 图片
 // 目标框架 .NET Framework 4.0+（Win10/11 自带 4.8，无需另装运行时）
 // 单文件 exe，约 50KB。
 
@@ -9,10 +9,12 @@ using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace Coolapk2MD
 {
@@ -222,6 +224,7 @@ namespace Coolapk2MD
         public int ImgNo;
         public List<string> Saved = new List<string>();
         public List<string> Failed = new List<string>();
+        public List<string> ChildFeeds;   // 正文里引用到的酷安文章（带 s 令牌）
         HashSet<string> used = new HashSet<string>();
 
         static readonly Regex Emoticon = new Regex(@"^https?://static\.coolapk\.com/emoticons/", RegexOptions.IgnoreCase);
@@ -367,6 +370,7 @@ namespace Coolapk2MD
         public int Images;
         public int FailedImages;
         public string Message = "";
+        public List<string> ChildFeeds = new List<string>();
     }
 
     sealed class FeedConverter
@@ -504,6 +508,7 @@ namespace Coolapk2MD
 
             Ctx ctx = new Ctx();
             ctx.OutDir = outDir;
+            ctx.ChildFeeds = result.ChildFeeds;
 
             log("转换正文 -> " + dirName);
             string coverLocal = null;
@@ -522,6 +527,77 @@ namespace Coolapk2MD
             result.Images = ctx.Saved.Count;
             result.FailedImages = ctx.Failed.Count;
             return result;
+        }
+
+        // ---------- 文中引用的文章
+
+        // 只有带 s 令牌的链接才可抓：裸 id 服务端只给壳页
+        static void CollectChildFeed(string href, Ctx ctx)
+        {
+            if (ctx == null || ctx.ChildFeeds == null) return;
+            Match m = IdRe.Match(href);
+            Match t = TokenRe.Match(href);
+            if (!m.Success || !t.Success) return;
+            string cid = m.Groups[1].Value;
+            string ctok = Uri.UnescapeDataString(t.Groups[1].Value);
+            if (ctok.Length == 0) return;
+            ctx.ChildFeeds.Add("https://www.coolapk.com/feed/" + cid + "?s=" + Uri.EscapeDataString(ctok));
+        }
+
+        // 主文章 + 文中引用的文章（广度优先，带数量与深度上限，防互相引用死循环）
+        public List<ConvertResult> ConvertTree(string rootRaw, string outRoot, int maxItems, int maxDepth,
+                                               Action<string> log, Action<int, int> progress)
+        {
+            List<ConvertResult> results = new List<ConvertResult>();
+            Queue<Tuple<string, int>> queue = new Queue<Tuple<string, int>>();
+            HashSet<string> seen = new HashSet<string>();
+
+            string rootId, rootTok;
+            ParseTarget(rootRaw, out rootId, out rootTok);
+            if (rootId != null) seen.Add(rootId);
+
+            queue.Enqueue(Tuple.Create(rootRaw, 0));
+            int done = 0;
+
+            while (queue.Count > 0 && done < maxItems)
+            {
+                Tuple<string, int> job = queue.Dequeue();
+                int depth = job.Item2;
+                string oneUrl = job.Item1;
+
+                string pid, ptok;
+                ParseTarget(oneUrl, out pid, out ptok);
+                if (pid == null || ptok == null) continue;
+
+                if (depth > 0)
+                    log("[引用 " + depth + " 层] feed/" + pid);
+                if (progress != null) progress(done, Math.Max(done + queue.Count + 1, done + 1));
+
+                ConvertResult r = Convert(oneUrl, outRoot);
+                done++;
+                results.Add(r);
+
+                // 失败的不再往下挖；已达深度上限也停止
+                if (r.Ok && depth < maxDepth)
+                {
+                    for (int i = 0; i < r.ChildFeeds.Count; i++)
+                    {
+                        string cid, ctok;
+                        ParseTarget(r.ChildFeeds[i], out cid, out ctok);
+                        if (cid == null || ctok == null) continue;
+                        if (seen.Contains(cid)) continue;
+                        seen.Add(cid);
+                        queue.Enqueue(Tuple.Create(r.ChildFeeds[i], depth + 1));
+                    }
+                }
+
+                if (progress != null) progress(done, done + queue.Count);
+            }
+
+            if (queue.Count > 0)
+                log("已达单次上限 " + maxItems + " 篇，剩余 " + queue.Count + " 篇未导出");
+
+            return results;
         }
 
         // ---------- 目标解析
@@ -700,6 +776,7 @@ namespace Coolapk2MD
                 if (href.Length == 0) return label;
                 string low = href.ToLowerInvariant();
                 if (low.StartsWith("javascript:") || low.StartsWith("#")) return label;
+                CollectChildFeed(href, ctx);
                 return "[" + label + "](" + MdUrl(href) + ")";
             }
 
@@ -903,24 +980,130 @@ namespace Coolapk2MD
     }
     // ============================================================ 视觉主题
 
+    // 系统自带的 TextBox 滚动条由 uxtheme 画，WinForms 不给开关。
+    // 这里调 Windows 10 1809+ 的非公开接口，把滚动条切到深色主题。
+    static class DarkApi
+    {
+        [DllImport("uxtheme.dll", EntryPoint = "#135", SetLastError = true)]
+        static extern int SetPreferredAppMode(int appMode);
+
+        [DllImport("uxtheme.dll", EntryPoint = "#133", SetLastError = true)]
+        static extern int AllowDarkModeForWindow(IntPtr hWnd, bool allow);
+
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        static extern int SetWindowTheme(IntPtr hWnd, string subApp, string subIdList);
+
+        // 0 默认 / 1 允许深色 / 2 强制深色 / 3 强制浅色
+        public static void SetAppMode(bool dark)
+        {
+            try { SetPreferredAppMode(dark ? 2 : 3); }
+            catch (Exception) { }
+        }
+
+        public static void ApplyWindow(IntPtr hwnd, bool dark)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            try
+            {
+                AllowDarkModeForWindow(hwnd, dark);
+                SetWindowTheme(hwnd, dark ? "DarkMode_Explorer" : "Explorer", null);
+            }
+            catch (Exception) { }
+        }
+    }
+
     static class Theme
     {
-        public static readonly Color Bg = Color.FromArgb(243, 245, 248);
-        public static readonly Color Card = Color.White;
-        public static readonly Color CardBorder = Color.FromArgb(233, 236, 240);
-        public static readonly Color Primary = Color.FromArgb(72, 174, 76);
-        public static readonly Color PrimaryHover = Color.FromArgb(64, 160, 68);
-        public static readonly Color PrimaryDown = Color.FromArgb(53, 140, 57);
-        public static readonly Color TextMain = Color.FromArgb(30, 34, 40);
-        public static readonly Color TextSub = Color.FromArgb(136, 143, 152);
-        public static readonly Color TextFaint = Color.FromArgb(160, 166, 174);
-        public static readonly Color Ghost = Color.FromArgb(242, 244, 247);
-        public static readonly Color GhostHover = Color.FromArgb(233, 236, 240);
-        public static readonly Color GhostDown = Color.FromArgb(222, 226, 231);
-        public static readonly Color GhostText = Color.FromArgb(70, 77, 85);
-        public static readonly Color Divider = Color.FromArgb(238, 241, 245);
-        public static readonly Color Track = Color.FromArgb(228, 232, 237);
-        public static readonly Color Danger = Color.FromArgb(210, 66, 66);
+        public static bool Dark;
+
+        public static Color Bg;
+        public static Color Card;
+        public static Color CardBorder;
+        public static Color Primary;
+        public static Color PrimaryHover;
+        public static Color PrimaryDown;
+        public static Color TextMain;
+        public static Color TextSub;
+        public static Color TextFaint;
+        public static Color Ghost;
+        public static Color GhostHover;
+        public static Color GhostDown;
+        public static Color GhostText;
+        public static Color Divider;
+        public static Color Track;
+        public static Color Danger;
+        public static Color DisabledFill;
+        public static Color DisabledText;
+
+        static Theme() { Apply(false); }
+
+        public static Color PrevTextMain, PrevTextSub, PrevTextFaint, PrevGhostText, PrevCard, PrevBg;
+
+        // 切换后把控件上的旧配色映射到新配色（用上一轮的色值识别语义）
+        public static Color MapText(Color c)
+        {
+            int a = c.ToArgb();
+            if (a == PrevTextMain.ToArgb()) return TextMain;
+            if (a == PrevTextSub.ToArgb()) return TextSub;
+            if (a == PrevTextFaint.ToArgb()) return TextFaint;
+            if (a == PrevGhostText.ToArgb()) return GhostText;
+            if (a == PrevCard.ToArgb()) return Card;
+            if (a == PrevBg.ToArgb()) return Bg;
+            return c;
+        }
+
+        public static void Apply(bool dark)
+        {
+            PrevTextMain = TextMain;
+            PrevTextSub = TextSub;
+            PrevTextFaint = TextFaint;
+            PrevGhostText = GhostText;
+            PrevCard = Card;
+            PrevBg = Bg;
+            Dark = dark;
+            if (dark)
+            {
+                Bg = Color.FromArgb(26, 29, 33);
+                Card = Color.FromArgb(36, 40, 45);
+                CardBorder = Color.FromArgb(52, 57, 63);
+                Primary = Color.FromArgb(76, 180, 84);
+                PrimaryHover = Color.FromArgb(88, 194, 96);
+                PrimaryDown = Color.FromArgb(62, 153, 70);
+                TextMain = Color.FromArgb(230, 233, 237);
+                TextSub = Color.FromArgb(152, 160, 170);
+                TextFaint = Color.FromArgb(126, 134, 144);
+                Ghost = Color.FromArgb(46, 51, 58);
+                GhostHover = Color.FromArgb(56, 62, 70);
+                GhostDown = Color.FromArgb(67, 74, 83);
+                GhostText = Color.FromArgb(198, 204, 212);
+                Divider = Color.FromArgb(47, 52, 59);
+                Track = Color.FromArgb(51, 56, 63);
+                Danger = Color.FromArgb(224, 92, 92);
+                DisabledFill = Color.FromArgb(58, 64, 72);
+                DisabledText = Color.FromArgb(122, 130, 140);
+            }
+            else
+            {
+                Bg = Color.FromArgb(243, 245, 248);
+                Card = Color.White;
+                CardBorder = Color.FromArgb(233, 236, 240);
+                Primary = Color.FromArgb(72, 174, 76);
+                PrimaryHover = Color.FromArgb(64, 160, 68);
+                PrimaryDown = Color.FromArgb(53, 140, 57);
+                TextMain = Color.FromArgb(30, 34, 40);
+                TextSub = Color.FromArgb(136, 143, 152);
+                TextFaint = Color.FromArgb(160, 166, 174);
+                Ghost = Color.FromArgb(242, 244, 247);
+                GhostHover = Color.FromArgb(233, 236, 240);
+                GhostDown = Color.FromArgb(222, 226, 231);
+                GhostText = Color.FromArgb(70, 77, 85);
+                Divider = Color.FromArgb(238, 241, 245);
+                Track = Color.FromArgb(228, 232, 237);
+                Danger = Color.FromArgb(210, 66, 66);
+                DisabledFill = Color.FromArgb(206, 212, 218);
+                DisabledText = Color.White;
+            }
+        }
     }
 
     static class Gfx
@@ -955,11 +1138,123 @@ namespace Coolapk2MD
 
     // ============================================================ 圆角控件
 
+    // 自绘复选框：圆角方块 + 绿色勾，与整体风格一致
+    sealed class RoundCheck : Control
+    {
+        public void ApplyTheme()
+        {
+            BackColor = Theme.Bg;
+            ForeColor = Theme.GhostText;
+            Invalidate();
+        }
+        bool _checked;
+        bool _hot;
+
+        public bool Checked
+        {
+            get { return _checked; }
+            set
+            {
+                if (_checked == value) return;
+                _checked = value;
+                Invalidate();
+                EventHandler h = CheckedChanged;
+                if (h != null) h(this, EventArgs.Empty);
+            }
+        }
+
+        public event EventHandler CheckedChanged;
+
+        public RoundCheck()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            DoubleBuffered = true;
+            BackColor = Theme.Bg;   // 与页面整体背景一致，避免出现白色块
+            Font = new Font("Microsoft YaHei", 9f);
+            ForeColor = Theme.GhostText;
+            Cursor = Cursors.Hand;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { _hot = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { _hot = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left) Checked = !Checked;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+            float k = DeviceDpi / 96f;
+            int box = (int)Math.Round(18 * k);
+            int pad = (int)Math.Round(5 * k);
+            int top = (Height - box) / 2;
+            Rectangle r = new Rectangle(pad, top, box, box);
+
+            using (GraphicsPath p = Gfx.RoundRect(r, (int)Math.Round(5 * k)))
+            {
+                if (_checked)
+                {
+                    using (SolidBrush b = new SolidBrush(_hot ? Theme.PrimaryHover : Theme.Primary))
+                        g.FillPath(b, p);
+                }
+                else
+                {
+                    using (SolidBrush b = new SolidBrush(Enabled ? Theme.Card : Theme.Ghost))
+                        g.FillPath(b, p);
+                    Color bd = _hot ? Theme.Primary : Theme.CardBorder;
+                    using (Pen pen = new Pen(bd, Math.Max(1f, 1.2f * k)))
+                        g.DrawPath(pen, p);
+                }
+            }
+
+            if (_checked)
+            {
+                using (Pen pen = new Pen(Color.White, Math.Max(1.6f, 2.1f * k)))
+                {
+                    pen.StartCap = LineCap.Round;
+                    pen.EndCap = LineCap.Round;
+                    pen.LineJoin = LineJoin.Round;
+                    PointF a = new PointF(r.X + box * 0.26f, r.Y + box * 0.52f);
+                    PointF b = new PointF(r.X + box * 0.44f, r.Y + box * 0.69f);
+                    PointF c = new PointF(r.X + box * 0.75f, r.Y + box * 0.33f);
+                    g.DrawLines(pen, new PointF[] { a, b, c });
+                }
+            }
+
+            string txt = Text;
+            if (txt.Length > 0)
+            {
+                int tx = r.Right + (int)Math.Round(7 * k);
+                using (SolidBrush b = new SolidBrush(Enabled ? ForeColor : Theme.TextFaint))
+                using (StringFormat sf = new StringFormat())
+                {
+                    sf.LineAlignment = StringAlignment.Center;
+                    sf.FormatFlags = StringFormatFlags.NoWrap;
+                    g.DrawString(txt, Font, b, new RectangleF(tx, 0, Width - tx, Height), sf);
+                }
+            }
+        }
+    }
+
     sealed class CardPanel : Panel
     {
         public int Radius = 12;
         public Color BorderColor = Theme.CardBorder;
         public bool DrawBorder = true;
+
+        public void ApplyTheme()
+        {
+            BackColor = Theme.Card;
+            BorderColor = Theme.CardBorder;
+            Invalidate();
+        }
 
         public CardPanel()
         {
@@ -997,6 +1292,26 @@ namespace Coolapk2MD
         public Color FillDown = Theme.PrimaryDown;
         public Color TextColor = Color.White;
         public bool BoldText = true;
+        public bool IsGhost;
+
+        public void ApplyTheme()
+        {
+            if (IsGhost)
+            {
+                Fill = Theme.Ghost;
+                FillHover = Theme.GhostHover;
+                FillDown = Theme.GhostDown;
+                TextColor = Theme.GhostText;
+            }
+            else
+            {
+                Fill = Theme.Primary;
+                FillHover = Theme.PrimaryHover;
+                FillDown = Theme.PrimaryDown;
+                TextColor = Color.White;
+            }
+            Invalidate();
+        }
 
         bool hovered;
         bool pressed;
@@ -1030,14 +1345,14 @@ namespace Coolapk2MD
 
             Color fill = Enabled
                 ? (pressed ? FillDown : (hovered ? FillHover : Fill))
-                : Color.FromArgb(206, 212, 218);
+                : Theme.DisabledFill;
 
             Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
             using (GraphicsPath path = Gfx.RoundRect(r, Radius))
             using (SolidBrush b = new SolidBrush(fill))
                 g.FillPath(b, path);
 
-            Color tc = Enabled ? TextColor : Color.White;
+            Color tc = Enabled ? TextColor : Theme.DisabledText;
             TextFormatFlags flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                                     TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
             TextRenderer.DrawText(g, Text, Font, ClientRectangle, tc, flags);
@@ -1052,6 +1367,19 @@ namespace Coolapk2MD
         public Color BorderFocus = Theme.Primary;
         int PadX { get { return (int)Math.Round(13 * DeviceDpi / 96.0); } }
         int PadY { get { return (int)Math.Round(8 * DeviceDpi / 96.0); } }
+
+        public void ApplyTheme()
+        {
+            BackColor = Theme.Card;
+            BorderColor = Theme.CardBorder;
+            BorderFocus = Theme.Primary;
+            if (Inner != null)
+            {
+                Inner.BackColor = Theme.Card;
+                if (Inner.Focused) BorderColor = Theme.Primary;
+            }
+            Invalidate();
+        }
 
         public RoundTextBox(bool multiline)
         {
@@ -1072,6 +1400,7 @@ namespace Coolapk2MD
             }
             Inner.GotFocus += delegate { BorderColor = BorderFocus; Invalidate(); };
             Inner.LostFocus += delegate { BorderColor = Theme.CardBorder; Invalidate(); };
+            Inner.HandleCreated += delegate { DarkApi.ApplyWindow(Inner.Handle, Theme.Dark); };
             Controls.Add(Inner);
         }
 
@@ -1166,6 +1495,7 @@ namespace Coolapk2MD
         RoundButton btnBrowse;
         RoundButton btnStart;
         RoundButton btnOpen;
+        RoundCheck chkTree;
         RoundProgress bar;
         RichTextBox rtbLog;
         RoundTextBox boxLinks;
@@ -1202,6 +1532,9 @@ float k = 1f;
 
         public MainForm(Icon appIcon)
         {
+            // 跟随系统深色/浅色设置
+            Theme.Apply(IsSystemDark());
+
             // DPI 手动缩放：DPI aware 进程里 AutoScale 会算出反向因子，故关闭自动缩放
             k = DetectScale();
             if (k < 1f) k = 1f;
@@ -1233,7 +1566,8 @@ float k = 1f;
             Panel header = new Panel();
             header.Dock = DockStyle.Top;
             header.Height = S(86);
-            header.BackColor = Color.White;
+            header.BackColor = Theme.Card;
+            header.Tag = "surface";
             header.Paint += delegate (object s, PaintEventArgs e)
             {
                 using (Pen p = new Pen(Theme.Divider))
@@ -1244,7 +1578,8 @@ float k = 1f;
             logo.Size = new Size(S(46), S(46));
             logo.Location = new Point(S(22), S(20));
             logo.SizeMode = PictureBoxSizeMode.Zoom;
-            logo.BackColor = Color.White;
+            logo.BackColor = Theme.Card;
+            logo.Tag = "surface";
             logo.Image = MakeLogo(S(92));
 
             Label lblTitle = new Label();
@@ -1309,7 +1644,7 @@ float k = 1f;
             boxLinks.Radius = S(10);
             boxLinks.Margin = new Padding(0);
             boxLinks.Inner.Font = new Font("Microsoft YaHei", 9f, FontStyle.Regular, GraphicsUnit.Point);
-            boxLinks.Inner.ForeColor = Color.FromArgb(56, 62, 70);
+            boxLinks.Inner.ForeColor = Theme.TextMain;
             txtLinks = boxLinks.Inner;
 
             t1.Controls.Add(lb1, 0, 0);
@@ -1370,10 +1705,11 @@ float k = 1f;
             // ---- 按钮行
             TableLayoutPanel t3 = new TableLayoutPanel();
             t3.Dock = DockStyle.Fill;
-            t3.ColumnCount = 2;
+            t3.ColumnCount = 3;
             t3.RowCount = 1;
             t3.Margin = new Padding(0);
             t3.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            t3.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(140)));
             t3.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(128)));
 
             btnStart = new RoundButton();
@@ -1384,6 +1720,11 @@ float k = 1f;
             btnStart.Margin = new Padding(0, 0, S(12), 0);
             btnStart.Click += BtnStart_Click;
 
+            chkTree = new RoundCheck();
+            chkTree.Text = "同时导出引用文章";
+            chkTree.Dock = DockStyle.Fill;
+            chkTree.Margin = new Padding(0, 0, S(12), 0);
+
             btnOpen = NewGhostButton("打开目录");
             btnOpen.Dock = DockStyle.Fill;
             btnOpen.Radius = S(10);
@@ -1392,7 +1733,8 @@ float k = 1f;
             btnOpen.Click += BtnOpen_Click;
 
             t3.Controls.Add(btnStart, 0, 0);
-            t3.Controls.Add(btnOpen, 1, 0);
+            t3.Controls.Add(chkTree, 1, 0);
+            t3.Controls.Add(btnOpen, 2, 0);
 
             // ---- 进度条
             bar = new RoundProgress();
@@ -1423,7 +1765,7 @@ float k = 1f;
             rtbLog.BackColor = Theme.Card;
             rtbLog.ReadOnly = true;
             rtbLog.Font = new Font("Microsoft YaHei", 9f, FontStyle.Regular, GraphicsUnit.Point);
-            rtbLog.ForeColor = Color.FromArgb(60, 64, 70);
+            rtbLog.ForeColor = Theme.TextMain;
             rtbLog.Margin = new Padding(0);
             rtbLog.HideSelection = false;
             rtbLog.DetectUrls = false;
@@ -1458,6 +1800,110 @@ float k = 1f;
             };
 
             LogDim("就绪。粘贴酷安分享链接后点击「开始导出」。");
+        }
+
+        // ---------- 深色模式：跟随系统设置，运行时切换
+
+        const int WM_SETTINGCHANGE = 0x001A;
+        const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+        [DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == WM_SETTINGCHANGE)
+            {
+                bool dark = IsSystemDark();
+                if (dark != Theme.Dark) ReapplyTheme(dark);
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            SetTitleBarDark(Theme.Dark);
+        }
+
+        // 读注册表：AppsUseLightTheme = 0 表示系统用深色
+        internal static bool IsSystemDark()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    if (key != null)
+                    {
+                        object v = key.GetValue("AppsUseLightTheme");
+                        if (v is int) return ((int)v) == 0;
+                    }
+                }
+            }
+            catch (Exception) { }
+            return false;
+        }
+
+        // 标题栏跟随深色（Win10 1809+ 支持，旧版忽略返回值）
+        void SetTitleBarDark(bool dark)
+        {
+            if (!IsHandleCreated) return;
+            try
+            {
+                int v = dark ? 1 : 0;
+                DwmSetWindowAttribute(Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref v, sizeof(int));
+            }
+            catch (Exception) { }
+        }
+
+        void ReapplyTheme(bool dark)
+        {
+            Theme.Apply(dark);
+            DarkApi.SetAppMode(dark);
+            ApplyThemeToControls(this);
+            BackColor = Theme.Bg;
+            SetTitleBarDark(dark);
+            Invalidate(true);
+
+            // 日志是按旧配色逐行着色的，深色下会变成黑字，清掉重新来
+            if (rtbLog != null && !running)
+            {
+                rtbLog.Clear();
+                LogDim(dark ? "已切换到深色模式。" : "已切换到浅色模式。");
+                LogDim("就绪。粘贴酷安分享链接后点击「开始导出」。");
+            }
+        }
+
+        void ApplyThemeToControls(Control root)
+        {
+            for (int i = 0; i < root.Controls.Count; i++)
+            {
+                Control c = root.Controls[i];
+
+                if (c is CardPanel) ((CardPanel)c).ApplyTheme();
+                else if (c is RoundTextBox) ((RoundTextBox)c).ApplyTheme();
+                else if (c is RoundButton) ((RoundButton)c).ApplyTheme();
+                else if (c is RoundCheck) ((RoundCheck)c).ApplyTheme();
+                else if (c is RoundProgress) c.Invalidate();
+                else if (c is Label) c.ForeColor = Theme.MapText(c.ForeColor);
+                else if (c is RichTextBox)
+                {
+                    c.BackColor = Theme.Card;
+                    c.ForeColor = Theme.TextMain;
+                    DarkApi.ApplyWindow(c.Handle, Theme.Dark);
+                }
+                else if ((c.Tag as string) == "surface") c.BackColor = Theme.Card;
+
+                if (c is TextBox)
+                {
+                    c.BackColor = Theme.Card;
+                    c.ForeColor = Theme.MapText(c.ForeColor);
+                    DarkApi.ApplyWindow(c.Handle, Theme.Dark);
+                }
+
+                ApplyThemeToControls(c);
+            }
         }
 
         // 与 app.ico 同构图的 Logo（不依赖 Icon.ToBitmap，避开 .NET 对 PNG 帧 ICO 的解析缺陷）
@@ -1517,6 +1963,7 @@ float k = 1f;
         {
             RoundButton b = new RoundButton();
             b.Text = text;
+            b.IsGhost = true;
             b.Fill = Theme.Ghost;
             b.FillHover = Theme.GhostHover;
             b.FillDown = Theme.GhostDown;
@@ -1567,10 +2014,13 @@ float k = 1f;
                 return;
             }
 
+            bool withRefs = chkTree.Checked;
+
             running = true;
             btnStart.Enabled = false;
             btnBrowse.Enabled = false;
             btnOpen.Enabled = false;
+            chkTree.Enabled = false;
             rtbLog.Clear();
             bar.MaxValue = targets.Count;
             bar.Value = 0;
@@ -1578,11 +2028,16 @@ float k = 1f;
             string saveDir = outDir;
             List<string> jobs = targets;
 
-            Log(string.Format("准备导出 {0} 篇 ...", jobs.Count), Theme.TextSub);
+            if (withRefs)
+                Log(string.Format("准备导出 {0} 篇（含文中引用的文章）...", jobs.Count), Theme.TextSub);
+            else
+                Log(string.Format("准备导出 {0} 篇 ...", jobs.Count), Theme.TextSub);
 
             Thread t = new Thread(delegate ()
             {
                 int ok = 0;
+                int total = 0;
+
                 for (int i = 0; i < jobs.Count; i++)
                 {
                     string one = jobs[i];
@@ -1591,32 +2046,49 @@ float k = 1f;
                     {
                         Directory.CreateDirectory(saveDir);
                         FeedConverter conv = new FeedConverter(LogDim);
-                        ConvertResult r = conv.Convert(one, saveDir);
-                        if (r.Ok)
+
+                        if (!withRefs)
                         {
-                            ok++;
-                            Log("  ├ 完成：" + r.MdPath, Theme.Primary);
-                            string imgLine = string.Format("  └ 图片 {0} 张", r.Images);
-                            if (r.FailedImages > 0)
-                                imgLine += string.Format("，失败 {0} 张（已保留原图链接）", r.FailedImages);
-                            Log(imgLine, Theme.Primary);
+                            ConvertResult r = conv.Convert(one, saveDir);
+                            total++;
+                            if (Report(r)) ok++;
+                            SetProgress(i + 1);
                         }
                         else
                         {
-                            Log("  └ 失败：" + r.Message, Theme.Danger);
+                            List<ConvertResult> rs = conv.ConvertTree(one, saveDir, 60, 3,
+                                LogDim, delegate (int doneN, int allN) { SetProgress(doneN, allN); });
+                            total += rs.Count;
+                            for (int j = 0; j < rs.Count; j++)
+                                if (Report(rs[j])) ok++;
                         }
                     }
                     catch (Exception ex)
                     {
                         Log("  └ 异常：" + ex.Message, Theme.Danger);
                     }
-                    SetProgress(i + 1);
                     Log("", Theme.TextSub);
                 }
-                Finish(ok, jobs.Count, saveDir);
+                Finish(ok, total, saveDir);
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        // 输出单篇结果，返回是否成功
+        bool Report(ConvertResult r)
+        {
+            if (r.Ok)
+            {
+                Log("  ├ 完成：" + r.MdPath, Theme.Primary);
+                string imgLine = string.Format("  └ 图片 {0} 张", r.Images);
+                if (r.FailedImages > 0)
+                    imgLine += string.Format("，失败 {0} 张（已保留原图链接）", r.FailedImages);
+                Log(imgLine, Theme.Primary);
+                return true;
+            }
+            Log("  └ 失败：" + r.Message, Theme.Danger);
+            return false;
         }
 
         void Finish(int ok, int total, string saveDir)
@@ -1630,6 +2102,7 @@ float k = 1f;
             btnStart.Enabled = true;
             btnBrowse.Enabled = true;
             btnOpen.Enabled = ok > 0;
+            chkTree.Enabled = true;
 
             if (ok == total)
                 Log(string.Format("全部完成：{0}/{1}", ok, total), Theme.Primary);
@@ -1646,12 +2119,25 @@ float k = 1f;
                 bar.BeginInvoke(new Action<int>(SetProgress), value);
                 return;
             }
+            if (value > bar.MaxValue) bar.MaxValue = value;
             bar.Value = value;
+        }
+
+        // 递归模式：总数会随发现的新文章增长
+        void SetProgress(int done, int total)
+        {
+            if (bar.InvokeRequired)
+            {
+                bar.BeginInvoke(new Action<int, int>(SetProgress), done, total);
+                return;
+            }
+            if (total > 0) bar.MaxValue = total;
+            bar.Value = Math.Min(done, bar.MaxValue);
         }
 
         // ---------- 日志（按级别着色）
 
-        void Log(string msg) { Log(msg, Color.FromArgb(60, 64, 70)); }
+        void Log(string msg) { Log(msg, Theme.TextMain); }
         void LogDim(string msg) { Log(msg, Theme.TextFaint); }
 
         void Log(string msg, Color color)
@@ -1699,6 +2185,9 @@ float k = 1f;
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            // 必须在建任何窗口之前，决定原生控件（含 TextBox 滚动条）走深色还是浅色主题
+            DarkApi.SetAppMode(MainForm.IsSystemDark());
 
             Icon appIcon = LoadAppIcon();
 

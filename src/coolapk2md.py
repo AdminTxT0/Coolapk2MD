@@ -244,6 +244,7 @@ class Ctx:
         self.img_no = 0
         self.saved: list[tuple[str, str]] = []   # (url, local_path)
         self.failed: list[str] = []
+        self.child_feeds: list[str] = []   # 正文里引用的酷安文章（带 s 令牌）
         self._used = set()
 
     def next_index(self) -> int:
@@ -354,6 +355,27 @@ def md_url(u: str) -> str:
         return u
 
 
+FEED_ID_RE = re.compile(r"coolapk\.com/feed/(\d+)", re.I)
+TOKEN_RE = re.compile(r"[?&]s=([A-Za-z0-9%_\-]+)")
+
+
+def collect_child_feed(href: str, ctx: Ctx) -> None:
+    """记录正文里引用到的酷安文章。只有带 s 令牌的才可抓。"""
+    m = FEED_ID_RE.search(href)
+    if not m:
+        return
+    t = TOKEN_RE.search(href)
+    if not t:
+        return
+    tok = urllib.parse.unquote(t.group(1))
+    if not tok:
+        return
+    ctx.child_feeds.append(
+        "https://www.coolapk.com/feed/" + m.group(1) + "?s="
+        + urllib.parse.quote(tok, safe="")
+    )
+
+
 def md_node(ch, ctx: Ctx) -> str:
     """渲染单个节点本身（含其子节点）。"""
     if isinstance(ch, str):
@@ -373,6 +395,7 @@ def md_node(ch, ctx: Ctx) -> str:
         if href and href.lower().startswith(("javascript:", "#")):
             return label
         if href:
+            collect_child_feed(href, ctx)
             return f"[{label}]({md_url(href)})"
         return label
 
@@ -630,11 +653,11 @@ def safe_name(s: str, limit: int = 60) -> str:
     return s[:limit].strip() or ""
 
 
-def convert(raw: str, outroot: str, quiet: bool = False) -> str | None:
+def convert(raw: str, outroot: str, quiet: bool = False) -> tuple[str | None, list[str]]:
     feed_id, token = parse_target(raw)
     if not feed_id:
         print(f"[error] 无法识别 feed id：{raw}", file=sys.stderr)
-        return None
+        return None, []
 
     if not quiet:
         print(f"[1/4] 抓取 feed/{feed_id} ...")
@@ -642,7 +665,7 @@ def convert(raw: str, outroot: str, quiet: bool = False) -> str | None:
         page, url = fetch_feed(feed_id, token)
     except Exception as e:  # noqa: BLE001
         print(f"[error] {e}", file=sys.stderr)
-        return None
+        return None, []
 
     if not quiet:
         print(f"[2/4] 解析 HTML ({len(page)} 字符) ...")
@@ -651,7 +674,7 @@ def convert(raw: str, outroot: str, quiet: bool = False) -> str | None:
     body = extract_body(meta["detail"])
     if body is None:
         print("[error] 未找到正文容器（页面结构可能已改版）。", file=sys.stderr)
-        return None
+        return None, []
 
     title = meta["title"] or ""
     if not title:
@@ -722,7 +745,41 @@ def convert(raw: str, outroot: str, quiet: bool = False) -> str | None:
         print(f"      图片     : {len(ctx.saved)} 张 -> {os.path.join(outdir, ctx.imgdir_name)}")
         if ctx.failed:
             print(f"      失败     : {len(ctx.failed)} 张（已在 md 中保留原链接）")
-    return md_path
+    return md_path, ctx.child_feeds
+
+
+def convert_tree(raw: str, outroot: str, max_items: int = 60, max_depth: int = 3,
+                 quiet: bool = False) -> tuple[int, int]:
+    """主文章 + 文中引用的文章，广度优先。返回 (成功数, 总数)。"""
+    root_id, _ = parse_target(raw)
+    seen: set[str] = set()
+    if root_id:
+        seen.add(root_id)
+    queue: list[tuple[str, int]] = [(raw, 0)]
+    ok = total = 0
+
+    while queue and total < max_items:
+        url, depth = queue.pop(0)
+        fid, _ = parse_target(url)
+        if not fid:
+            continue
+        if depth > 0 and not quiet:
+            print(f"--- 引用 {depth} 层：feed/{fid}")
+        md_path, children = convert(url, outroot, quiet)
+        total += 1
+        if md_path:
+            ok += 1
+            if depth < max_depth:
+                for c in children:
+                    cid, _ = parse_target(c)
+                    if not cid or cid in seen:
+                        continue
+                    seen.add(cid)
+                    queue.append((c, depth + 1))
+
+    if queue:
+        print(f"[warn] 已达上限 {max_items} 篇，剩余 {len(queue)} 篇未导出", file=sys.stderr)
+    return ok, total
 
 
 def json_quote(s: str) -> str:
@@ -746,6 +803,8 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--out", default="out", help="输出根目录（默认 ./out）")
     ap.add_argument("-f", "--file", help="从文本文件批量读取链接，一行一个")
     ap.add_argument("-q", "--quiet", action="store_true", help="静默模式")
+    ap.add_argument("--with-refs", action="store_true",
+                    help="同时导出文中引用的文章（最多 60 篇 / 3 层）")
     ap.add_argument("-v", "--version", action="version", version=f"coolapk2md {VERSION}")
     args = ap.parse_args(argv)
 
@@ -765,14 +824,22 @@ def main(argv=None) -> int:
 
     os.makedirs(args.out, exist_ok=True)
     ok = 0
+    total = 0
     for t in targets:
         if not args.quiet:
             print(f"=== {t}")
-        if convert(t, args.out, args.quiet):
-            ok += 1
+        if args.with_refs:
+            d, n = convert_tree(t, args.out, quiet=args.quiet)
+            ok += d
+            total += n
+        else:
+            md_path, _children = convert(t, args.out, args.quiet)
+            total += 1
+            if md_path:
+                ok += 1
         if not args.quiet:
             print()
-    print(f"完成 {ok}/{len(targets)}")
+    print(f"完成 {ok}/{total}")
     return 0 if ok else 1
 
 

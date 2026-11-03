@@ -4,14 +4,16 @@
 
 纯本地运行，不登录、不上传、不联网除下载文章与图片外不做任何请求。
 
-![界面预览](docs/ui-preview.png)
+| 浅色 | 深色 |
+| --- | --- |
+| ![浅色](docs/ui-preview.png) | ![深色](docs/dark-preview.png) |
 
 ---
 
 ## 特性
 
 - **两种形态，功能一致**
-  - 图形界面：`Coolapk2MD.exe`，105 KB，双击即用，Win10/11 免安装
+  - 图形界面：`Coolapk2MD.exe`，112 KB，双击即用，Win10/11 免安装
   - 命令行：`coolapk2md.py`，零第三方依赖，Python 3.8+
 - **完整还原内容**
   - 标题、作者、发布时间、发布机型、原文链接
@@ -20,6 +22,12 @@
 - **两种页面结构都支持**
   - 图文长文（`feed-article-message`）
   - 普通动态（`feed-message`，配图在 `message-image-group` 里）
+- **同时导出引用文章**
+  - 正文里提到的其它酷安文章可以一并抓下来，勾选一个框就行
+  - 广度优先往下找，按 feed id 去重，最多 60 篇 / 3 层
+- **深色模式**
+  - 自动跟随系统深浅色设置，在「设置 → 个性化 → 颜色」里切换即时生效
+  - 标题栏、输入框滚动条这类系统绘制的部件也一起变色
 - **工程细节**
   - 图片按真实字节修正扩展名（服务端有时用 `.jpg` 名义返回 PNG）
   - 下载失败重试 3 次，仍失败则保留原始 URL，不丢内容
@@ -38,9 +46,18 @@
 1. 下载 `dist/Coolapk2MD.exe`
 2. 双击运行
 3. 在酷安 App 里打开文章 → 右上角分享 → **复制链接**
-4. 粘贴进窗口，选保存目录，点「开始导出」
+4. 粘贴进窗口，选保存目录
+5. 需要连同文中提到的其它文章一起导出时，勾选 **「同时导出引用文章」**
+6. 点「开始导出」
 
 > 需要 .NET Framework 4.8。Win10 1903+ 与 Win11 已内置，Win7 需单独安装。
+
+关于「同时导出引用文章」：勾选后会把正文里出现的酷安文章链接一并抓下来，
+**并继续往下找**。以 `feed/72078845` 那篇实测，一次导出 9 篇 ——
+主文章 + 8 篇被引用的，其中 3 篇标题都叫 `#ProjectTreble#`，
+目录自动加 feed id 后缀区分，不会互相覆盖。
+
+安全上限：**最多 60 篇、最深 3 层**，按 feed id 去重，互相引用的死循环不会重复抓。
 
 ### 二、命令行（Python）
 
@@ -56,6 +73,9 @@ python src/coolapk2md.py -o "D:\Notes\酷安" "URL"
 
 # 从文件批量读取（一行一条，# 开头为注释）
 python src/coolapk2md.py -f urls.txt
+
+# 连同文中引用的文章一起导出（最多 60 篇 / 3 层）
+python src/coolapk2md.py --with-refs "https://www.coolapk.com/feed/72078845?s=xxx"
 ```
 
 exe 同样支持命令行模式，便于批处理：
@@ -103,12 +123,18 @@ scripts\build.bat
 
 ```
 酷安导出/
-└── ColorOS 移植教程/
+├── ColorOS 移植教程/          # 主文章
+│   ├── index.md
+│   └── images/
+│       ├── 01.jpg      # 封面
+│       ├── 02.jpg      # 正文配图，按阅读顺序编号
+│       └── ...
+├── 说下ColorOS16 连wifi软重启怎么修的/   # 勾选后多出来的引用文章
+│   ├── index.md
+│   └── images/
+└── #ProjectTreble#_69919700/            # 同名文章自动加 id 后缀
     ├── index.md
     └── images/
-        ├── 01.jpg      # 封面
-        ├── 02.jpg      # 正文配图，按阅读顺序编号
-        └── ...
 ```
 
 `index.md` 结构：
@@ -145,6 +171,7 @@ source: "https://www.coolapk.com/feed/..."
 | 限制 | 说明 |
 | --- | --- |
 | 必须带 `?s=` | 裸 id 服务端只给壳页，需回 App 重新分享 |
+| 裸 id 的引用抓不到 | 「同时导出引用文章」只能跟进带 `?s=` 的链接；作者贴的通常是 App 分享的完整链接，很少碰到 |
 | 评论区 | 网页版不提供，无法导出 |
 | 视频 / 动图 | 只导出静态封面 |
 | 表情包 | 不下载（`static.coolapk.com/emoticons/`），按 alt 文本保留，如「流泪」 |
@@ -213,8 +240,8 @@ Coolapk2MD/
 ├── .github/
 │   └── workflows/build.yml  # CI：Windows 上自动编译并上传产物
 ├── src/
-│   ├── Coolapk2MD.cs      # WinForms 版（自绘圆角控件，约 1750 行）
-│   ├── coolapk2md.py      # Python 版（零依赖，约 760 行）
+│   ├── Coolapk2MD.cs      # WinForms 版（自绘圆角控件，约 2150 行）
+│   ├── coolapk2md.py      # Python 版（零依赖，约 800 行）
 │   └── app.ico            # 应用图标（16/32/48/64 BMP 帧）
 ├── scripts/
 │   ├── build.bat          # 一键编译
@@ -222,7 +249,8 @@ Coolapk2MD/
 ├── dist/
 │   └── Coolapk2MD.exe     # 预编译产物
 ├── docs/
-│   ├── ui-preview.png
+│   ├── ui-preview.png     # 浅色界面
+│   ├── dark-preview.png   # 深色界面
 │   └── technical.md       # 实现细节与踩坑记录
 └── examples/
     └── sample-output/     # 输出格式示例

@@ -88,6 +88,29 @@ https://.../xxx.jpeg@642x1852.jpeg.m.jpg
 `@642x1852` 这类尺寸后缀也可以完全去掉，直接请求原图路径即可。
 其他变体（如把 `.m.jpg` 换成 `.l.jpg`）多数返回 404。
 
+### 引用其它文章的链接
+
+正文里指向其它酷安文章的 `<a>`，作者贴的通常是 App 分享出来的完整链接：
+
+```
+https://www.coolapk.com/feed/67928960?s=MDc3MTBiYmIyMGVjNDE1ZzZhMWE1YjZhega1454&shareUid=34522133&shareFrom=com.coolapk.market_14.5.4
+```
+
+令牌在链接里现成可用，**不需要重新分享**。抽出来时只保留 `feed/{id}?s={token}`，
+去掉 `shareUid`、`shareFrom` 这些跟踪参数：
+
+```
+FEED_ID_RE = r"coolapk\.com/feed/(\d+)"
+TOKEN_RE   = r"[?&]s=([A-Za-z0-9%_\-]+)"
+```
+
+实测 `feed/72078845` 正文有 8 个这样的链接，逐一抓取全部成功；
+其中被引用的文章自己也引用了别的动态，第 2 层同样能拿到。
+只有裸 `feed/{id}`（不带 `?s=`）才会退回壳页 —— 这是递归导出唯一的死角。
+
+递归策略是广度优先 + 按 feed id 去重 + 深度/数量上限（3 层 / 60 篇），
+避免一篇文章引出一整个论坛。子文章与主文章平级放在同一个输出根目录下。
+
 ---
 
 ## 三、WinForms 界面的坑
@@ -176,6 +199,50 @@ t2row.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 这是**测试脚本**的问题，不是程序的问题。可靠的自动化方式是：
 真实鼠标点击 + 剪贴板 `^v` 粘贴。
 
+### 7. 深色模式没有官方 API
+
+WinForms 不会自动跟随系统深色。可用的是一套未公开接口：
+
+| 接口 | DLL / 序号 | 作用 |
+| --- | --- | --- |
+| `SetPreferredAppMode` | uxtheme `#135` | 进程级明暗（2 = 强制深色，3 = 强制浅色） |
+| `AllowDarkModeForWindow` | uxtheme `#133` | 允许单个窗口使用深色 |
+| `SetWindowTheme(hwnd, "DarkMode_Explorer", null)` | uxtheme | 让控件改用深色主题绘制 |
+| `DwmSetWindowAttribute(hwnd, 20, &1, 4)` | dwmapi | 标题栏深色（Win10 1809+） |
+
+两个时机决定成败：
+
+- `SetPreferredAppMode` 必须在 `Application.EnableVisualStyles()` 之后、
+  **创建任何窗口之前**调用，晚了不生效。
+- `SetWindowTheme` 要在控件 Handle 创建后调用（挂 `HandleCreated` 事件）。
+
+系统是否深色读注册表
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize` 的
+`AppsUseLightTheme`（`0` = 深色）。变化通知是 `WM_SETTINGCHANGE`（`0x001A`）。
+
+这些序号接口在旧系统上不存在，必须 `try/catch` 兜底，否则直接崩。
+
+### 8. TextBox 的滚动条不是 WinForms 画的
+
+多行 `TextBox` 右侧的滚动条由 `uxtheme` 绘制，没有任何托管属性可以改它的颜色，
+深色界面下会突兀地留一条白边（实测 `RGB(240,240,240)`）。
+只能靠第 7 条里的 `SetWindowTheme` 把它切到深色主题，切完是 `RGB(23,23,23)`。
+
+排查时的坑：`RichTextBox` 的窗口类名是 `RICHEDIT50W`，
+用 `*EDIT*` 模糊匹配会把两者都选中，得写成
+`-like "*EDIT*" -and -notlike "*RICHEDIT*"` 才能只挑出 TextBox。
+
+### 9. 自绘控件要单独开文字抗锯齿
+
+`Control` 派生的自绘控件如果不设 `TextRenderingHint`，
+`Graphics.DrawString` 会走默认渲染，笔画发虚（尤其小字号）。
+
+```csharp
+g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+```
+
+`SmoothingMode.AntiAlias` 只影响图形轮廓（圆角、线条），**对文字无效**，两者要分别设。
+
 ---
 
 ## 四、图片与文件处理
@@ -228,3 +295,10 @@ Windows 非法字符 `\ / : * ? " < > |` 全部替换为 `_`，
    - 采样结果同时验证了配色与圆角是否真的绘制
 3. **端到端**：真实鼠标点击 + 剪贴板粘贴 + 等待产物落盘，检查 md 与图片数量
 4. **命令行回归**：同一链接跑 CLI 模式，与界面输出比对
+5. **深色模式**：改注册表 `AppsUseLightTheme` 后广播 `WM_SETTINGCHANGE`
+   （`SendMessageTimeout(HWND_BROADCAST, 0x001A, 0, "ImmersiveColorSet", SMTO_ABORTIFHUNG, ...)`），
+   再采样验证。测试脚本必须用 `try/finally` 把注册表改回原值。
+   预期值：页面底 `RGB(26,29,33)`、卡片 `RGB(36,40,45)`、主文字 `RGB(230,233,237)`、
+   输入框滚动条 `RGB(23,23,23)`；浅色下滚动条应为 `RGB(240,240,240)`。
+6. **递归导出回归**：固定用 `feed/72078845` 这一篇，勾选后应得到 9 个目录，
+   逐个核对 md 大小与图片张数；Python 版跑 `--with-refs` 后与图形界面产物比对。
