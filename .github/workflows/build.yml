@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        shell: cmd
+        run: |
+          "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /?
+          echo.
+
+      - name: Build
+        shell: cmd
+        run: scripts\build.bat
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/Coolapk2MD.exe")) { throw "build output missing" }
+          $size = (Get-Item "dist/Coolapk2MD.exe").Length
+          Write-Host "artifact size: $size bytes"
+          if ($size -lt 50000) { throw "artifact seems too small" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coolapk2MD
+          path: dist/Coolapk2MD.exe
+          if-no-files-found: error

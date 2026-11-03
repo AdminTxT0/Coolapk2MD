@@ -1,0 +1,26 @@
+# 编译中间产物
+*.pdb
+*.obj
+*.res
+bin/
+obj/
+
+# 运行输出（保留 examples 里的示例，排除本地产出）
+out/
+coolapk2md.log.txt
+
+# 编辑器与 IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
