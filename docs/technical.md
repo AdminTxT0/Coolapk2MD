@@ -243,6 +243,26 @@ g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
 
 `SmoothingMode.AntiAlias` 只影响图形轮廓（圆角、线条），**对文字无效**，两者要分别设。
 
+### 10. `String.Replace("")` 会直接抛异常
+
+`"abc".Replace("", "x")` 在 C# 里会抛 `ArgumentException: 字符串的长度不能为零`；
+而 Python 的 `"abc".replace("", "x")` 合法，返回原串。
+
+机型字段取自 `username-item` 第二个 `<p>` 里的 `<span>`，
+再用 `full.Replace(device, "")` 从「时间 + 机型」的合并文本里裁掉机型。
+遇到**机型 span 是空标签**的文章（例如 `feed/67228350`），`device` 是空串，
+这一行就让整篇导出失败。
+
+修法是裁剪前判空：
+
+```csharp
+if (device.Length > 0)
+    full = full.Replace(device, "").Trim();
+```
+
+这个 bug 只在 C# 版存在，Python 版天生不会触发 —— 这是两版独立实现的代价，
+凡是拿变量当 `oldValue` 的 `Replace` 调用，都要先想想它可能为空。
+
 ---
 
 ## 四、图片与文件处理

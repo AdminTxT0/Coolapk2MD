@@ -473,7 +473,9 @@ namespace Coolapk2MD
                     if (sp != null)
                     {
                         device = NormWs(TextOf(sp));
-                        full = full.Replace(device, "").Trim();
+                        // 有些文章的机型 span 是空标签，空串做 Replace 的 oldValue 会抛异常
+                        if (device.Length > 0)
+                            full = full.Replace(device, "").Trim();
                     }
                     date = full;
                 }
